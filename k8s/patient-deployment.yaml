@@ -1,0 +1,37 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: patient-deployment
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: patient
+  template:
+    metadata:
+      labels:
+        app: patient
+    spec:
+      serviceAccountName: default
+      containers:
+      - name: patient
+        image: healthcare-micro-vuln/patient:latest
+        securityContext:
+          privileged: true
+          runAsUser: 0
+        env:
+        - name: DB_PASS
+          value: "secret123"
+        ports:
+        - containerPort: 8000
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: patient-service
+spec:
+  selector:
+    app: patient
+  ports:
+  - port: 8000
+    targetPort: 8000

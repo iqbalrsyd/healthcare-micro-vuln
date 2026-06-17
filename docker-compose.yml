@@ -1,0 +1,81 @@
+version: '3.8'
+
+services:
+  auth:
+    build: ./services/auth
+    ports:
+      - "8001:8000"
+    environment:
+      - DB_HOST=auth-db
+      - DB_USER=admin
+      - DB_PASS=secret123
+      - JWT_SECRET=weakjwtsecret
+    depends_on:
+      - auth-db
+
+  patient:
+    build: ./services/patient
+    ports:
+      - "8002:8000"
+    environment:
+      - DB_HOST=patient-db
+      - DB_USER=admin
+      - DB_PASS=secret123
+      - AUTH_SERVICE_URL=http://auth:8000
+    depends_on:
+      - patient-db
+      - auth
+
+  appointment:
+    build: ./services/appointment
+    ports:
+      - "8003:8000"
+    environment:
+      - DB_HOST=appointment-db
+      - DB_USER=admin
+      - DB_PASS=secret123
+      - AUTH_SERVICE_URL=http://auth:8000
+    depends_on:
+      - appointment-db
+      - auth
+
+  billing:
+    build: ./services/billing
+    ports:
+      - "8004:8000"
+    environment:
+      - DB_HOST=billing-db
+      - DB_USER=admin
+      - DB_PASS=secret123
+      - AUTH_SERVICE_URL=http://auth:8000
+    depends_on:
+      - billing-db
+      - auth
+
+  auth-db:
+    image: postgres:13
+    environment:
+      - POSTGRES_USER=admin
+      - POSTGRES_PASSWORD=secret123
+      - POSTGRES_DB=auth
+
+  patient-db:
+    image: postgres:13
+    environment:
+      - POSTGRES_USER=admin
+      - POSTGRES_PASSWORD=secret123
+      - POSTGRES_DB=patient
+
+  appointment-db:
+    image: postgres:13
+    environment:
+      - POSTGRES_USER=admin
+      - POSTGRES_PASSWORD=secret123
+      - POSTGRES_DB=appointment
+
+  billing-db:
+    image: postgres:13
+    environment:
+      - POSTGRES_USER=admin
+      - POSTGRES_PASSWORD=secret123
+      - POSTGRES_DB=billing
