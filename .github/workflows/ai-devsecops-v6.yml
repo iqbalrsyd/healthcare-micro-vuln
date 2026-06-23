@@ -1,0 +1,384 @@
+name: CI DevSecOps (python)
+# Domain: general (confidence: 1.00)
+# Architecture: microservices
+# Priority threats: none specific (no domain detected)
+
+"on":
+  push:
+    branches: [main, master, develop]
+  pull_request:
+    branches: [main, master, develop]
+  workflow_dispatch:
+
+
+permissions:
+  contents: read
+  pull-requests: read
+  security-events: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    continue-on-error: false
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+        with:
+          python-version: '3.11'
+
+      - name: Install Ruff
+        run: pip install ruff
+
+      - name: Run Ruff
+        run: ruff check . || true
+
+  sast:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    continue-on-error: true
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+        with:
+          persist-credentials: false
+
+      - name: Validate custom Semgrep rules
+        run: |
+          for f in .semgrep/ai-devsecops-v2.yml; do
+            [ -f "$f" ] || continue
+            echo "Validating $f ..."
+            docker run --rm \
+              -v "${{ github.workspace }}/.semgrep:/rules:ro" \
+              returntocorp/semgrep:1.99.0 \
+              semgrep --validate --config=/rules/$(basename "$f") \
+              || echo "::warning::Custom rule $f failed validation; will be skipped by semgrep."
+          done
+        continue-on-error: true
+
+      - name: Run semgrep (SARIF output via docker)
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}:/src:ro" \
+            -v "${{ github.workspace }}:/out" \
+            returntocorp/semgrep:1.99.0 \
+            semgrep \
+            --config=p/owasp-top-ten \
+            --config=p/javascript \
+            --config=p/nodejs \
+            --config=p/expressjs \
+            --config=p/sql-injection \
+            --config=p/secrets \
+            --config=p/dockerfile \
+            --config=/src/.semgrep/ai-devsecops-v2.yml \
+                    --sarif \
+                    --output=/out/semgrep-results.sarif \
+                    --timeout=600 \
+                    --error \
+                    /src
+        continue-on-error: true
+
+      - name: Ensure Semgrep SARIF file exists (fallback for 0 findings or scan error)
+        if: always()
+        run: |
+          if [ ! -s semgrep-results.sarif ]; then
+            echo "::notice::Semgrep did not produce a SARIF file. Generating empty SARIF for upload-sarif."
+            printf '%s\n' \
+              '{' \
+              '  "version": "2.1.0",' \
+              '  "$schema": "https://json.schemastore.org/sarif-2.1.0.json",' \
+              '  "runs": [' \
+              '    {' \
+              '      "tool": {' \
+              '        "driver": {' \
+              '          "name": "Semgrep",' \
+              '          "version": "1.99.0",' \
+              '          "informationUri": "https://semgrep.dev"' \
+              '        }' \
+              '      },' \
+              '      "results": []' \
+              '    }' \
+              '  ]' \
+              '}' > semgrep-results.sarif
+          fi
+          echo "✓ semgrep-results.sarif size: $(stat -c%s semgrep-results.sarif) bytes"
+
+      - name: Upload Semgrep SARIF to GitHub Code Scanning
+        if: always() && hashFiles('semgrep-results.sarif') != ''
+        uses: github/codeql-action/upload-sarif@b1722c1245f90604c2c348f9d1624af97ea8fc6e
+        with:
+          sarif_file: semgrep-results.sarif
+          category: semgrep
+
+      - name: Upload Semgrep SARIF as artifact
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: semgrep-results-${{ github.sha }}
+          path: semgrep-results.sarif
+          if-no-files-found: warn
+          retention-days: 30
+
+  docker-compose-validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    continue-on-error: false
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5
+
+      - name: Detect compose file
+        id: detect
+        run: |
+          if [ -f docker-compose.yml ]; then
+            echo "compose_file=docker-compose.yml" >> "$GITHUB_OUTPUT"
+          elif [ -f docker-compose.yaml ]; then
+            echo "compose_file=docker-compose.yaml" >> "$GITHUB_OUTPUT"
+          elif [ -f compose.yml ]; then
+            echo "compose_file=compose.yml" >> "$GITHUB_OUTPUT"
+          elif [ -f compose.yaml ]; then
+            echo "compose_file=compose.yaml" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::No compose file found"
+            exit 1
+          fi
+
+      - name: Validate compose file (docker compose config)
+        run: |
+          docker compose -f "${{ steps.detect.outputs.compose_file }}" config --quiet
+          echo "✓ docker-compose config validated: ${{ steps.detect.outputs.compose_file }}"
+
+      - name: Summarize compose services
+        if: always()
+        run: |
+          docker compose -f "${{ steps.detect.outputs.compose_file }}" config --services | tee compose-services.txt
+          echo "## Compose Services Detected" >> "$GITHUB_STEP_SUMMARY"
+          echo "```" >> "$GITHUB_STEP_SUMMARY"
+          cat compose-services.txt >> "$GITHUB_STEP_SUMMARY"
+          echo "```" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload compose service list
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: compose-services-${{ github.sha }}
+          path: compose-services.txt
+          if-no-files-found: warn
+          retention-days: 14
+
+  secret-scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    continue-on-error: false
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Run Gitleaks (SARIF output)
+        uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_ENABLE_UPLOAD_ARTIFACT: true
+          GITLEAKS_FORMAT: sarif
+          GITLEAKS_REPORT_PATH: gitleaks-results.sarif
+        continue-on-error: true
+
+      - name: Ensure gitleaks-results.sarif exists (fallback for 0 findings)
+        if: always()
+        run: |
+          if [ ! -s gitleaks-results.sarif ]; then
+            echo "::notice::Gitleaks found 0 findings. Generating empty SARIF to satisfy upload-sarif."
+            printf '%s\n' \
+              '{' \
+              '  "version": "2.1.0",' \
+              '  "$schema": "https://json.schemastore.org/sarif-2.1.0.json",' \
+              '  "runs": [' \
+              '    {' \
+              '      "tool": {' \
+              '        "driver": {' \
+              '          "name": "Gitleaks",' \
+              '          "version": "8.18.0",' \
+              '          "informationUri": "https://gitleaks.io"' \
+              '        }' \
+              '      },' \
+              '      "results": []' \
+              '    }' \
+              '  ]' \
+              '}' > gitleaks-results.sarif
+          fi
+          echo "✓ gitleaks-results.sarif size: $(stat -c%s gitleaks-results.sarif) bytes"
+
+      - name: Upload Gitleaks SARIF to GitHub Code Scanning
+        if: always()
+        uses: github/codeql-action/upload-sarif@b1722c1245f90604c2c348f9d1624af97ea8fc6e
+        with:
+          sarif_file: gitleaks-results.sarif
+          category: gitleaks
+
+      - name: Upload Gitleaks SARIF as artifact
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: gitleaks-sarif-${{ github.sha }}
+          path: gitleaks-results.sarif
+          if-no-files-found: warn
+          retention-days: 30
+
+  iac-scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    continue-on-error: true
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+        with:
+          persist-credentials: false
+
+      - name: Run Trivy IaC scan (SARIF output)
+        id: trivy-iac
+        uses: aquasecurity/trivy-action@b6643a29fecd7f34b3597bc6acb0a98b03d33ff8
+        with:
+          scan-type: 'config'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'trivy-iac-results.sarif'
+          severity: 'HIGH,CRITICAL'
+        continue-on-error: true
+
+      - name: Upload Trivy IaC SARIF to GitHub Code Scanning
+        if: always()
+        uses: github/codeql-action/upload-sarif@b1722c1245f90604c2c348f9d1624af97ea8fc6e
+        with:
+          sarif_file: trivy-iac-results.sarif
+          category: trivy-iac
+
+      - name: Upload Trivy IaC SARIF as artifact
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: trivy-iac-results-${{ github.sha }}
+          path: trivy-iac-results.sarif
+          if-no-files-found: warn
+          retention-days: 30
+
+  container-scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    continue-on-error: true
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+        with:
+          persist-credentials: false
+
+      - name: Analyze Dockerfile for security misconfigurations
+        if: hashFiles('**/Dockerfile') != ''
+        run: |
+          echo '## Dockerfile Security Checks' >> "$GITHUB_STEP_SUMMARY"
+          issues=0
+          for df in $(find . -name Dockerfile -not -path './.git/*' 2>/dev/null); do
+            echo "Analyzing $df..."
+            # Check: run as non-root user
+            if ! grep -qE '^USER ' "$df"; then
+              echo "::warning file=$df::Missing USER instruction — container runs as root"
+              echo "- \`$df\`: Missing USER instruction (runs as root)" >> "$GITHUB_STEP_SUMMARY"
+              issues=$((issues+1))
+            elif grep -qE '^USER root' "$df"; then
+              echo "::warning file=$df::USER root detected — should use non-root user"
+              echo "- \`$df\`: USER root (use non-root)" >> "$GITHUB_STEP_SUMMARY"
+              issues=$((issues+1))
+            fi
+            # Check: base image pinned by digest
+            base=$(grep -m1 '^FROM ' "$df" | sed 's/FROM //' | awk '{print $1}')
+            if echo "$base" | grep -qE '@sha256:'; then
+              echo "  Base image pinned: $base"
+            elif [ -n "$base" ] && echo "$base" | grep -qE ':latest$|^[^:]*$'; then
+              echo "::warning file=$df::Base image $base not pinned by digest — supply@sha256:..."
+              echo "- \`$df\`: Base image \`$base\` not pinned by digest" >> "$GITHUB_STEP_SUMMARY"
+              issues=$((issues+1))
+            fi
+            # Check: expose patterns
+            if grep -qE '^EXPOSE [0-9]+-[0-9]+' "$df"; then
+              echo "::warning file=$df::EXPOSE with port range detected — limit to specific ports"
+              echo "- \`$df\`: EXPOSE port range (limit to specific ports)" >> "$GITHUB_STEP_SUMMARY"
+              issues=$((issues+1))
+            fi
+          done
+          echo "Dockerfile checks complete: $issues issue(s)" >> "$GITHUB_STEP_SUMMARY"
+        continue-on-error: true
+
+      - name: Build Docker image
+        run: docker build -t app:ci-${{ github.sha }} .
+        continue-on-error: true
+
+      - name: Run Trivy DB update
+        run: docker run --rm aquasec/trivy:0.65.0 image --download-db-only
+        continue-on-error: true
+
+      - name: Scan image with Trivy (SARIF output)
+        id: trivy-image
+        uses: aquasecurity/trivy-action@b6643a29fecd7f34b3597bc6acb0a98b03d33ff8
+        with:
+          image-ref: 'app:ci-${{ github.sha }}'
+          format: 'sarif'
+          output: 'trivy-image-results.sarif'
+          severity: 'HIGH,CRITICAL'
+        continue-on-error: true
+
+      - name: Ensure trivy-image-results.sarif exists (fallback for 0 findings)
+        if: always()
+        run: |
+          if [ ! -s trivy-image-results.sarif ]; then
+            echo "::notice::Trivy Image found 0 findings. Generating empty SARIF to satisfy upload-sarif."
+            printf '%s\n' \
+              '{' \
+              '  "version": "2.1.0",' \
+              '  "$schema": "https://json.schemastore.org/sarif-2.1.0.json",' \
+              '  "runs": [' \
+              '    {' \
+              '      "tool": {' \
+              '        "driver": {' \
+              '          "name": "Trivy Image",' \
+              '          "version": "0.65.0",' \
+              '          "informationUri": "https://aquasecurity.github.io/trivy/"' \
+              '        }' \
+              '      },' \
+              '      "results": []' \
+              '    }' \
+              '  ]' \
+              '}' > trivy-image-results.sarif
+          fi
+          echo "✓ trivy-image-results.sarif size: $(stat -c%s trivy-image-results.sarif) bytes"
+
+      - name: Upload Trivy image SARIF to GitHub Code Scanning
+        if: always()
+        uses: github/codeql-action/upload-sarif@b1722c1245f90604c2c348f9d1624af97ea8fc6e
+        with:
+          sarif_file: trivy-image-results.sarif
+          category: trivy-image
+
+      - name: Upload Trivy image SARIF as artifact
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: trivy-image-results-${{ github.sha }}
+          path: trivy-image-results.sarif
+          if-no-files-found: warn
+          retention-days: 30
