@@ -1,0 +1,585 @@
+name: "AI DevSecOps \u2014 Domain Compliance (e-commerce)"
+'on':
+  workflow_call:
+    inputs:
+      detected_domain:
+        description: Domain classification from the AI agent.
+        required: false
+        type: string
+        default: e-commerce
+permissions:
+  contents: read
+  security-events: write
+jobs:
+  ecommerce-payment-stripe-webhook-verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    continue-on-error: true
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+      with:
+        persist-credentials: false
+    - name: scan-stripe-webhook-handler
+      run: "# Set up output capture for the annotation-to-SARIF step.\nexec > >(tee\
+        \ -a ecommerce-payment-stripe-webhook.shell_log) 2>&1\n# Run the original\
+        \ script in a subshell with set +e so\n# that any single command failure does\
+        \ not abort the\n# script before it can emit a '::error' annotation.\ninner_exit=0\n\
+        ( set +e\nfail=0\n# Check webhook handler exists\nif ! grep -rnE 'stripe\\\
+        .webhooks\\.constructEvent' src/ 2>/dev/null | grep -q .; then\n  echo '::error\
+        \ file=src/routes/webhook.js::Stripe webhook signature not verified \u2014\
+        \ use stripe.webhooks.constructEvent()'\n  fail=1\nfi\n# Check Stripe API\
+        \ key loaded from env, not hardcoded\nif grep -rnE 'sk_(live|test)_[A-Za-z0-9]{20,}'\
+        \ src/ 2>/dev/null | grep -v process.env | grep -q .; then\n  echo '::error\
+        \ file=src/config/stripe.js::Hardcoded Stripe key found in source \u2014 move\
+        \ to process.env.STRIPE_SECRET_KEY'\n  fail=1\nfi\nexit $fail\n) || inner_exit=$?\n\
+        # If the inner script exited non-zero and emitted no\n# '::error'/'::warning'\
+        \ annotation, synthesise one so the\n# SARIF conversion step still has a finding\
+        \ to record.\nif [ \"$inner_exit\" -ne 0 ] && ! grep -qE '^::(error|warning)'\
+        \ ecommerce-payment-stripe-webhook.shell_log; then\n  echo \"::error file=scan-stripe-webhook-handler::shell\
+        \ check failed (exit code $inner_exit) \u2014 see run log for details\"\n\
+        fi\nexit $inner_exit\n"
+    - name: Convert ecommerce-payment-stripe-webhook shell_check annotations to SARIF
+      if: always()
+      run: "cat > ecommerce-payment-stripe-webhook_annotations_to_sarif.py <<'PY_EOF'\n\
+        import os, re, json\nlog_path = 'ecommerce-payment-stripe-webhook.shell_log'\n\
+        sarif_path = 'ecommerce-payment-stripe-webhook-results.sarif'\ntool_name =\
+        \ 'ecommerce-payment-stripe-webhook'\ntool_version = '1.0.0'\ninformation_uri\
+        \ = 'https://github.com/iqbalrsyd/ai-devsecops'\nrule_id_prefix = 'ai-devsecops-ecommerce-payment-stripe-webhook'\n\
+        results = []\nif os.path.exists(log_path):\n    pat = re.compile(\n      \
+        \  r'^::(error|warning)(?:\\s+([A-Za-z]+=[^,]+(?:,[A-Za-z]+=[^,]+)*))?::(.*)$'\n\
+        \    )\n    for idx, line in enumerate(open(log_path, encoding='utf-8', errors='replace')):\n\
+        \        m = pat.match(line.rstrip('\\n'))\n        if not m:\n          \
+        \  continue\n        level, props, msg = m.groups()\n        path = None\n\
+        \        sl = None\n        el = None\n        title = None\n        if props:\n\
+        \            for kv in props.split(','):\n                if '=' in kv:\n\
+        \                    k, v = kv.split('=', 1)\n                    k = k.strip()\n\
+        \                    v = v.strip()\n                    if k == 'file':\n\
+        \                        path = v\n                    elif k == 'line':\n\
+        \                        try:\n                            sl = int(v)\n \
+        \                       except ValueError:\n                            pass\n\
+        \                    elif k in ('endLine', 'col'):\n                     \
+        \   try:\n                            el = int(v) if k == 'endLine' else sl\n\
+        \                        except ValueError:\n                            pass\n\
+        \                    elif k == 'title':\n                        title = v\n\
+        \        if sl is None:\n            sl = 1\n        if el is None:\n    \
+        \        el = sl\n        sarif_level = 'error' if level == 'error' else 'warning'\n\
+        \        msg = (msg or '').strip()\n        # If there is no file but there\
+        \ is a title, use the\n        if not msg and title:\n            msg = title\n\
+        \        # Use the first 50 chars of the title (if any) as\n        slug_src\
+        \ = title or msg or 'finding'\n        slug = re.sub(r'[^a-z0-9]+', '-', slug_src.lower())[:50].strip('-')\n\
+        \        rule_id = f'{rule_id_prefix}-{slug}-{sl}-{idx}'\n        results.append({\n\
+        \            'ruleId': rule_id,\n            'level': sarif_level,\n     \
+        \       'message': {'text': msg or '(no message)'},\n            'locations':\
+        \ [{\n                'physicalLocation': {\n                    'artifactLocation':\
+        \ {'uri': path or 'unknown'},\n                    'region': {'startLine':\
+        \ sl, 'endLine': el},\n                },\n            }],\n        })\nexisting\
+        \ = {}\nif os.path.exists(sarif_path) and os.path.getsize(sarif_path) > 0:\n\
+        \    try:\n        existing = json.load(open(sarif_path, encoding='utf-8'))\n\
+        \    except Exception:\n        existing = {}\nif not existing or 'runs' not\
+        \ in existing or not existing['runs']:\n    existing = {\n        'version':\
+        \ '2.1.0',\n        '$schema': 'https://json.schemastore.org/sarif-2.1.0.json',\n\
+        \        'runs': [{\n            'tool': {'driver': {\n                'name':\
+        \ tool_name, 'version': tool_version, 'informationUri': information_uri,\n\
+        \            }},\n            'results': [],\n        }],\n    }\nexisting['runs'][0]['tool']['driver']['name']\
+        \ = tool_name\nexisting['runs'][0]['tool']['driver']['version'] = tool_version\n\
+        existing['runs'][0]['tool']['driver']['informationUri'] = information_uri\n\
+        existing['runs'][0]['results'] = (existing['runs'][0].get('results') or [])\
+        \ + results\nwith open(sarif_path, 'w', encoding='utf-8') as f:\n    json.dump(existing,\
+        \ f, indent=2)\nprint(f'Wrote {len(results)} SARIF result(s) to {sarif_path}')\n\
+        PY_EOF\npython3 ecommerce-payment-stripe-webhook_annotations_to_sarif.py\n"
+    - name: Ensure ecommerce-payment-stripe-webhook-results.sarif exists (fallback
+        for 0 findings)
+      if: always()
+      run: "if [ ! -s ecommerce-payment-stripe-webhook-results.sarif ]; then\n  echo\
+        \ \"::notice::ecommerce-payment-stripe-webhook found 0 findings. Generating\
+        \ empty SARIF to satisfy upload-sarif.\"\n  printf '%s\\n' \\\n    '{' \\\n\
+        \    '  \"version\": \"2.1.0\",' \\\n    '  \"$schema\": \"https://json.schemastore.org/sarif-2.1.0.json\"\
+        ,' \\\n    '  \"runs\": [' \\\n    '    {' \\\n    '      \"tool\": {' \\\n\
+        \    '        \"driver\": {' \\\n    '          \"name\": \"ecommerce-payment-stripe-webhook\"\
+        ,' \\\n    '          \"version\": \"0.65.0\",' \\\n    '          \"informationUri\"\
+        : \"https://aquasecurity.github.io/trivy/\"' \\\n    '        }' \\\n    '\
+        \      },' \\\n    '      \"results\": []' \\\n    '    }' \\\n    '  ]' \\\
+        \n    '}' > ecommerce-payment-stripe-webhook-results.sarif\nfi\necho \"\u2713\
+        \ ecommerce-payment-stripe-webhook-results.sarif size: $(stat -c%s ecommerce-payment-stripe-webhook-results.sarif)\
+        \ bytes\"\n"
+    - name: Upload ecommerce-payment-stripe-webhook SARIF to GitHub Code Scanning
+      if: always()
+      uses: github/codeql-action/upload-sarif@b1722c1245f90604c2c348f9d1624af97ea8fc6e
+      with:
+        sarif_file: ecommerce-payment-stripe-webhook-results.sarif
+        category: ecommerce-payment-stripe-webhook
+  ecommerce-cart-bola-ownership:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    continue-on-error: true
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+      with:
+        persist-credentials: false
+    - name: scan-cart-order-ownership
+      run: "# Set up output capture for the annotation-to-SARIF step.\nexec > >(tee\
+        \ -a ecommerce-cart-bola.shell_log) 2>&1\n# Run the original script in a subshell\
+        \ with set +e so\n# that any single command failure does not abort the\n#\
+        \ script before it can emit a '::error' annotation.\ninner_exit=0\n( set +e\n\
+        fail=0\n# Find GET /cart/:id or GET /orders/:id routes\nfor route in cart\
+        \ orders; do\n  if grep -rnE \"router\\.(get|post)\\s*\\(\\s*['\\\"]\\/?$route\\\
+        /:id\" src/ 2>/dev/null | grep -q .; then\n    # Check if ownership verification\
+        \ is present in same file\n    if ! grep -rnE '(req\\.user\\.id|userId|ownerId|verifyOwnership)'\
+        \ src/routes/$route.js 2>/dev/null | grep -q .; then\n      echo \"::error\
+        \ file=src/routes/$route.js::$route route uses :id parameter without ownership\
+        \ verification \u2014 vulnerable to BOLA/IDOR\"\n      fail=1\n    fi\n  fi\n\
+        done\nexit $fail\n) || inner_exit=$?\n# If the inner script exited non-zero\
+        \ and emitted no\n# '::error'/'::warning' annotation, synthesise one so the\n\
+        # SARIF conversion step still has a finding to record.\nif [ \"$inner_exit\"\
+        \ -ne 0 ] && ! grep -qE '^::(error|warning)' ecommerce-cart-bola.shell_log;\
+        \ then\n  echo \"::error file=scan-cart-order-ownership::shell check failed\
+        \ (exit code $inner_exit) \u2014 see run log for details\"\nfi\nexit $inner_exit\n"
+    - name: Convert ecommerce-cart-bola shell_check annotations to SARIF
+      if: always()
+      run: "cat > ecommerce-cart-bola_annotations_to_sarif.py <<'PY_EOF'\nimport os,\
+        \ re, json\nlog_path = 'ecommerce-cart-bola.shell_log'\nsarif_path = 'ecommerce-cart-bola-results.sarif'\n\
+        tool_name = 'ecommerce-cart-bola'\ntool_version = '1.0.0'\ninformation_uri\
+        \ = 'https://github.com/iqbalrsyd/ai-devsecops'\nrule_id_prefix = 'ai-devsecops-ecommerce-cart-bola'\n\
+        results = []\nif os.path.exists(log_path):\n    pat = re.compile(\n      \
+        \  r'^::(error|warning)(?:\\s+([A-Za-z]+=[^,]+(?:,[A-Za-z]+=[^,]+)*))?::(.*)$'\n\
+        \    )\n    for idx, line in enumerate(open(log_path, encoding='utf-8', errors='replace')):\n\
+        \        m = pat.match(line.rstrip('\\n'))\n        if not m:\n          \
+        \  continue\n        level, props, msg = m.groups()\n        path = None\n\
+        \        sl = None\n        el = None\n        title = None\n        if props:\n\
+        \            for kv in props.split(','):\n                if '=' in kv:\n\
+        \                    k, v = kv.split('=', 1)\n                    k = k.strip()\n\
+        \                    v = v.strip()\n                    if k == 'file':\n\
+        \                        path = v\n                    elif k == 'line':\n\
+        \                        try:\n                            sl = int(v)\n \
+        \                       except ValueError:\n                            pass\n\
+        \                    elif k in ('endLine', 'col'):\n                     \
+        \   try:\n                            el = int(v) if k == 'endLine' else sl\n\
+        \                        except ValueError:\n                            pass\n\
+        \                    elif k == 'title':\n                        title = v\n\
+        \        if sl is None:\n            sl = 1\n        if el is None:\n    \
+        \        el = sl\n        sarif_level = 'error' if level == 'error' else 'warning'\n\
+        \        msg = (msg or '').strip()\n        # If there is no file but there\
+        \ is a title, use the\n        if not msg and title:\n            msg = title\n\
+        \        # Use the first 50 chars of the title (if any) as\n        slug_src\
+        \ = title or msg or 'finding'\n        slug = re.sub(r'[^a-z0-9]+', '-', slug_src.lower())[:50].strip('-')\n\
+        \        rule_id = f'{rule_id_prefix}-{slug}-{sl}-{idx}'\n        results.append({\n\
+        \            'ruleId': rule_id,\n            'level': sarif_level,\n     \
+        \       'message': {'text': msg or '(no message)'},\n            'locations':\
+        \ [{\n                'physicalLocation': {\n                    'artifactLocation':\
+        \ {'uri': path or 'unknown'},\n                    'region': {'startLine':\
+        \ sl, 'endLine': el},\n                },\n            }],\n        })\nexisting\
+        \ = {}\nif os.path.exists(sarif_path) and os.path.getsize(sarif_path) > 0:\n\
+        \    try:\n        existing = json.load(open(sarif_path, encoding='utf-8'))\n\
+        \    except Exception:\n        existing = {}\nif not existing or 'runs' not\
+        \ in existing or not existing['runs']:\n    existing = {\n        'version':\
+        \ '2.1.0',\n        '$schema': 'https://json.schemastore.org/sarif-2.1.0.json',\n\
+        \        'runs': [{\n            'tool': {'driver': {\n                'name':\
+        \ tool_name, 'version': tool_version, 'informationUri': information_uri,\n\
+        \            }},\n            'results': [],\n        }],\n    }\nexisting['runs'][0]['tool']['driver']['name']\
+        \ = tool_name\nexisting['runs'][0]['tool']['driver']['version'] = tool_version\n\
+        existing['runs'][0]['tool']['driver']['informationUri'] = information_uri\n\
+        existing['runs'][0]['results'] = (existing['runs'][0].get('results') or [])\
+        \ + results\nwith open(sarif_path, 'w', encoding='utf-8') as f:\n    json.dump(existing,\
+        \ f, indent=2)\nprint(f'Wrote {len(results)} SARIF result(s) to {sarif_path}')\n\
+        PY_EOF\npython3 ecommerce-cart-bola_annotations_to_sarif.py\n"
+    - name: Ensure ecommerce-cart-bola-results.sarif exists (fallback for 0 findings)
+      if: always()
+      run: "if [ ! -s ecommerce-cart-bola-results.sarif ]; then\n  echo \"::notice::ecommerce-cart-bola\
+        \ found 0 findings. Generating empty SARIF to satisfy upload-sarif.\"\n  printf\
+        \ '%s\\n' \\\n    '{' \\\n    '  \"version\": \"2.1.0\",' \\\n    '  \"$schema\"\
+        : \"https://json.schemastore.org/sarif-2.1.0.json\",' \\\n    '  \"runs\"\
+        : [' \\\n    '    {' \\\n    '      \"tool\": {' \\\n    '        \"driver\"\
+        : {' \\\n    '          \"name\": \"ecommerce-cart-bola\",' \\\n    '    \
+        \      \"version\": \"0.65.0\",' \\\n    '          \"informationUri\": \"\
+        https://aquasecurity.github.io/trivy/\"' \\\n    '        }' \\\n    '   \
+        \   },' \\\n    '      \"results\": []' \\\n    '    }' \\\n    '  ]' \\\n\
+        \    '}' > ecommerce-cart-bola-results.sarif\nfi\necho \"\u2713 ecommerce-cart-bola-results.sarif\
+        \ size: $(stat -c%s ecommerce-cart-bola-results.sarif) bytes\"\n"
+    - name: Upload ecommerce-cart-bola SARIF to GitHub Code Scanning
+      if: always()
+      uses: github/codeql-action/upload-sarif@b1722c1245f90604c2c348f9d1624af97ea8fc6e
+      with:
+        sarif_file: ecommerce-cart-bola-results.sarif
+        category: ecommerce-cart-bola
+  ecommerce-checkout-price-server-validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    continue-on-error: true
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+      with:
+        persist-credentials: false
+    - name: scan-checkout-price-from-body
+      run: "# Set up output capture for the annotation-to-SARIF step.\nexec > >(tee\
+        \ -a ecommerce-checkout-price.shell_log) 2>&1\n# Run the original script in\
+        \ a subshell with set +e so\n# that any single command failure does not abort\
+        \ the\n# script before it can emit a '::error' annotation.\ninner_exit=0\n\
+        ( set +e\nfail=0\n# Look for direct req.body.price/amount usage in checkout\
+        \ logic\nif grep -rnE 'req\\.body\\.(price|amount|total|grand_total)' src/routes/checkout.js\
+        \ src/controllers/checkout.js 2>/dev/null | grep -q .; then\n  echo '::error\
+        \ file=src/routes/checkout.js::Price/amount read from req.body \u2014 fetch\
+        \ from DB (Product.findById(id).price) instead'\n  fail=1\nfi\nexit $fail\n\
+        ) || inner_exit=$?\n# If the inner script exited non-zero and emitted no\n\
+        # '::error'/'::warning' annotation, synthesise one so the\n# SARIF conversion\
+        \ step still has a finding to record.\nif [ \"$inner_exit\" -ne 0 ] && ! grep\
+        \ -qE '^::(error|warning)' ecommerce-checkout-price.shell_log; then\n  echo\
+        \ \"::error file=scan-checkout-price-from-body::shell check failed (exit code\
+        \ $inner_exit) \u2014 see run log for details\"\nfi\nexit $inner_exit\n"
+    - name: Convert ecommerce-checkout-price shell_check annotations to SARIF
+      if: always()
+      run: "cat > ecommerce-checkout-price_annotations_to_sarif.py <<'PY_EOF'\nimport\
+        \ os, re, json\nlog_path = 'ecommerce-checkout-price.shell_log'\nsarif_path\
+        \ = 'ecommerce-checkout-price-results.sarif'\ntool_name = 'ecommerce-checkout-price'\n\
+        tool_version = '1.0.0'\ninformation_uri = 'https://github.com/iqbalrsyd/ai-devsecops'\n\
+        rule_id_prefix = 'ai-devsecops-ecommerce-checkout-price'\nresults = []\nif\
+        \ os.path.exists(log_path):\n    pat = re.compile(\n        r'^::(error|warning)(?:\\\
+        s+([A-Za-z]+=[^,]+(?:,[A-Za-z]+=[^,]+)*))?::(.*)$'\n    )\n    for idx, line\
+        \ in enumerate(open(log_path, encoding='utf-8', errors='replace')):\n    \
+        \    m = pat.match(line.rstrip('\\n'))\n        if not m:\n            continue\n\
+        \        level, props, msg = m.groups()\n        path = None\n        sl =\
+        \ None\n        el = None\n        title = None\n        if props:\n     \
+        \       for kv in props.split(','):\n                if '=' in kv:\n     \
+        \               k, v = kv.split('=', 1)\n                    k = k.strip()\n\
+        \                    v = v.strip()\n                    if k == 'file':\n\
+        \                        path = v\n                    elif k == 'line':\n\
+        \                        try:\n                            sl = int(v)\n \
+        \                       except ValueError:\n                            pass\n\
+        \                    elif k in ('endLine', 'col'):\n                     \
+        \   try:\n                            el = int(v) if k == 'endLine' else sl\n\
+        \                        except ValueError:\n                            pass\n\
+        \                    elif k == 'title':\n                        title = v\n\
+        \        if sl is None:\n            sl = 1\n        if el is None:\n    \
+        \        el = sl\n        sarif_level = 'error' if level == 'error' else 'warning'\n\
+        \        msg = (msg or '').strip()\n        # If there is no file but there\
+        \ is a title, use the\n        if not msg and title:\n            msg = title\n\
+        \        # Use the first 50 chars of the title (if any) as\n        slug_src\
+        \ = title or msg or 'finding'\n        slug = re.sub(r'[^a-z0-9]+', '-', slug_src.lower())[:50].strip('-')\n\
+        \        rule_id = f'{rule_id_prefix}-{slug}-{sl}-{idx}'\n        results.append({\n\
+        \            'ruleId': rule_id,\n            'level': sarif_level,\n     \
+        \       'message': {'text': msg or '(no message)'},\n            'locations':\
+        \ [{\n                'physicalLocation': {\n                    'artifactLocation':\
+        \ {'uri': path or 'unknown'},\n                    'region': {'startLine':\
+        \ sl, 'endLine': el},\n                },\n            }],\n        })\nexisting\
+        \ = {}\nif os.path.exists(sarif_path) and os.path.getsize(sarif_path) > 0:\n\
+        \    try:\n        existing = json.load(open(sarif_path, encoding='utf-8'))\n\
+        \    except Exception:\n        existing = {}\nif not existing or 'runs' not\
+        \ in existing or not existing['runs']:\n    existing = {\n        'version':\
+        \ '2.1.0',\n        '$schema': 'https://json.schemastore.org/sarif-2.1.0.json',\n\
+        \        'runs': [{\n            'tool': {'driver': {\n                'name':\
+        \ tool_name, 'version': tool_version, 'informationUri': information_uri,\n\
+        \            }},\n            'results': [],\n        }],\n    }\nexisting['runs'][0]['tool']['driver']['name']\
+        \ = tool_name\nexisting['runs'][0]['tool']['driver']['version'] = tool_version\n\
+        existing['runs'][0]['tool']['driver']['informationUri'] = information_uri\n\
+        existing['runs'][0]['results'] = (existing['runs'][0].get('results') or [])\
+        \ + results\nwith open(sarif_path, 'w', encoding='utf-8') as f:\n    json.dump(existing,\
+        \ f, indent=2)\nprint(f'Wrote {len(results)} SARIF result(s) to {sarif_path}')\n\
+        PY_EOF\npython3 ecommerce-checkout-price_annotations_to_sarif.py\n"
+    - name: Ensure ecommerce-checkout-price-results.sarif exists (fallback for 0 findings)
+      if: always()
+      run: "if [ ! -s ecommerce-checkout-price-results.sarif ]; then\n  echo \"::notice::ecommerce-checkout-price\
+        \ found 0 findings. Generating empty SARIF to satisfy upload-sarif.\"\n  printf\
+        \ '%s\\n' \\\n    '{' \\\n    '  \"version\": \"2.1.0\",' \\\n    '  \"$schema\"\
+        : \"https://json.schemastore.org/sarif-2.1.0.json\",' \\\n    '  \"runs\"\
+        : [' \\\n    '    {' \\\n    '      \"tool\": {' \\\n    '        \"driver\"\
+        : {' \\\n    '          \"name\": \"ecommerce-checkout-price\",' \\\n    '\
+        \          \"version\": \"0.65.0\",' \\\n    '          \"informationUri\"\
+        : \"https://aquasecurity.github.io/trivy/\"' \\\n    '        }' \\\n    '\
+        \      },' \\\n    '      \"results\": []' \\\n    '    }' \\\n    '  ]' \\\
+        \n    '}' > ecommerce-checkout-price-results.sarif\nfi\necho \"\u2713 ecommerce-checkout-price-results.sarif\
+        \ size: $(stat -c%s ecommerce-checkout-price-results.sarif) bytes\"\n"
+    - name: Upload ecommerce-checkout-price SARIF to GitHub Code Scanning
+      if: always()
+      uses: github/codeql-action/upload-sarif@b1722c1245f90604c2c348f9d1624af97ea8fc6e
+      with:
+        sarif_file: ecommerce-checkout-price-results.sarif
+        category: ecommerce-checkout-price
+  ecommerce-pci-card-data-no-logging:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    continue-on-error: true
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+      with:
+        persist-credentials: false
+    - name: scan-pci-card-data-leak
+      run: "# Set up output capture for the annotation-to-SARIF step.\nexec > >(tee\
+        \ -a ecommerce-pci-card-logging.shell_log) 2>&1\n# Run the original script\
+        \ in a subshell with set +e so\n# that any single command failure does not\
+        \ abort the\n# script before it can emit a '::error' annotation.\ninner_exit=0\n\
+        ( set +e\nfail=0\n# Detect card-like fields passed to loggers or stored in\
+        \ plaintext\nif grep -rnE '(console\\.log|logger\\.(info|debug|warn)|winston\\\
+        .log)\\s*\\([^)]*(card[_-]?number|pan|cvv|cvc)' src/ 2>/dev/null | grep -q\
+        \ .; then\n  echo '::error file=src/payments/log.ts::Card data (PAN/CVV) passed\
+        \ to logger \u2014 strip before logging (PCI DSS 3.2)'\n  fail=1\nfi\n# Detect\
+        \ card number variable in plain-text storage (localStorage, plaintext write)\n\
+        if grep -rnE \"localStorage\\.setItem\\s*\\(\\s*[\\\"'][^\\\"']*(card|pan)\"\
+        \ src/ 2>/dev/null | grep -q .; then\n  echo '::error file=src/checkout/cart.ts::Card\
+        \ data persisted to localStorage \u2014 never store PAN client-side'\n  fail=1\n\
+        fi\nexit $fail\n) || inner_exit=$?\n# If the inner script exited non-zero\
+        \ and emitted no\n# '::error'/'::warning' annotation, synthesise one so the\n\
+        # SARIF conversion step still has a finding to record.\nif [ \"$inner_exit\"\
+        \ -ne 0 ] && ! grep -qE '^::(error|warning)' ecommerce-pci-card-logging.shell_log;\
+        \ then\n  echo \"::error file=scan-pci-card-data-leak::shell check failed\
+        \ (exit code $inner_exit) \u2014 see run log for details\"\nfi\nexit $inner_exit\n"
+    - name: Convert ecommerce-pci-card-logging shell_check annotations to SARIF
+      if: always()
+      run: "cat > ecommerce-pci-card-logging_annotations_to_sarif.py <<'PY_EOF'\n\
+        import os, re, json\nlog_path = 'ecommerce-pci-card-logging.shell_log'\nsarif_path\
+        \ = 'ecommerce-pci-card-logging-results.sarif'\ntool_name = 'ecommerce-pci-card-logging'\n\
+        tool_version = '1.0.0'\ninformation_uri = 'https://github.com/iqbalrsyd/ai-devsecops'\n\
+        rule_id_prefix = 'ai-devsecops-ecommerce-pci-card-logging'\nresults = []\n\
+        if os.path.exists(log_path):\n    pat = re.compile(\n        r'^::(error|warning)(?:\\\
+        s+([A-Za-z]+=[^,]+(?:,[A-Za-z]+=[^,]+)*))?::(.*)$'\n    )\n    for idx, line\
+        \ in enumerate(open(log_path, encoding='utf-8', errors='replace')):\n    \
+        \    m = pat.match(line.rstrip('\\n'))\n        if not m:\n            continue\n\
+        \        level, props, msg = m.groups()\n        path = None\n        sl =\
+        \ None\n        el = None\n        title = None\n        if props:\n     \
+        \       for kv in props.split(','):\n                if '=' in kv:\n     \
+        \               k, v = kv.split('=', 1)\n                    k = k.strip()\n\
+        \                    v = v.strip()\n                    if k == 'file':\n\
+        \                        path = v\n                    elif k == 'line':\n\
+        \                        try:\n                            sl = int(v)\n \
+        \                       except ValueError:\n                            pass\n\
+        \                    elif k in ('endLine', 'col'):\n                     \
+        \   try:\n                            el = int(v) if k == 'endLine' else sl\n\
+        \                        except ValueError:\n                            pass\n\
+        \                    elif k == 'title':\n                        title = v\n\
+        \        if sl is None:\n            sl = 1\n        if el is None:\n    \
+        \        el = sl\n        sarif_level = 'error' if level == 'error' else 'warning'\n\
+        \        msg = (msg or '').strip()\n        # If there is no file but there\
+        \ is a title, use the\n        if not msg and title:\n            msg = title\n\
+        \        # Use the first 50 chars of the title (if any) as\n        slug_src\
+        \ = title or msg or 'finding'\n        slug = re.sub(r'[^a-z0-9]+', '-', slug_src.lower())[:50].strip('-')\n\
+        \        rule_id = f'{rule_id_prefix}-{slug}-{sl}-{idx}'\n        results.append({\n\
+        \            'ruleId': rule_id,\n            'level': sarif_level,\n     \
+        \       'message': {'text': msg or '(no message)'},\n            'locations':\
+        \ [{\n                'physicalLocation': {\n                    'artifactLocation':\
+        \ {'uri': path or 'unknown'},\n                    'region': {'startLine':\
+        \ sl, 'endLine': el},\n                },\n            }],\n        })\nexisting\
+        \ = {}\nif os.path.exists(sarif_path) and os.path.getsize(sarif_path) > 0:\n\
+        \    try:\n        existing = json.load(open(sarif_path, encoding='utf-8'))\n\
+        \    except Exception:\n        existing = {}\nif not existing or 'runs' not\
+        \ in existing or not existing['runs']:\n    existing = {\n        'version':\
+        \ '2.1.0',\n        '$schema': 'https://json.schemastore.org/sarif-2.1.0.json',\n\
+        \        'runs': [{\n            'tool': {'driver': {\n                'name':\
+        \ tool_name, 'version': tool_version, 'informationUri': information_uri,\n\
+        \            }},\n            'results': [],\n        }],\n    }\nexisting['runs'][0]['tool']['driver']['name']\
+        \ = tool_name\nexisting['runs'][0]['tool']['driver']['version'] = tool_version\n\
+        existing['runs'][0]['tool']['driver']['informationUri'] = information_uri\n\
+        existing['runs'][0]['results'] = (existing['runs'][0].get('results') or [])\
+        \ + results\nwith open(sarif_path, 'w', encoding='utf-8') as f:\n    json.dump(existing,\
+        \ f, indent=2)\nprint(f'Wrote {len(results)} SARIF result(s) to {sarif_path}')\n\
+        PY_EOF\npython3 ecommerce-pci-card-logging_annotations_to_sarif.py\n"
+    - name: Ensure ecommerce-pci-card-logging-results.sarif exists (fallback for 0
+        findings)
+      if: always()
+      run: "if [ ! -s ecommerce-pci-card-logging-results.sarif ]; then\n  echo \"\
+        ::notice::ecommerce-pci-card-logging found 0 findings. Generating empty SARIF\
+        \ to satisfy upload-sarif.\"\n  printf '%s\\n' \\\n    '{' \\\n    '  \"version\"\
+        : \"2.1.0\",' \\\n    '  \"$schema\": \"https://json.schemastore.org/sarif-2.1.0.json\"\
+        ,' \\\n    '  \"runs\": [' \\\n    '    {' \\\n    '      \"tool\": {' \\\n\
+        \    '        \"driver\": {' \\\n    '          \"name\": \"ecommerce-pci-card-logging\"\
+        ,' \\\n    '          \"version\": \"0.65.0\",' \\\n    '          \"informationUri\"\
+        : \"https://aquasecurity.github.io/trivy/\"' \\\n    '        }' \\\n    '\
+        \      },' \\\n    '      \"results\": []' \\\n    '    }' \\\n    '  ]' \\\
+        \n    '}' > ecommerce-pci-card-logging-results.sarif\nfi\necho \"\u2713 ecommerce-pci-card-logging-results.sarif\
+        \ size: $(stat -c%s ecommerce-pci-card-logging-results.sarif) bytes\"\n"
+    - name: Upload ecommerce-pci-card-logging SARIF to GitHub Code Scanning
+      if: always()
+      uses: github/codeql-action/upload-sarif@b1722c1245f90604c2c348f9d1624af97ea8fc6e
+      with:
+        sarif_file: ecommerce-pci-card-logging-results.sarif
+        category: ecommerce-pci-card-logging
+  ecommerce-inventory-race-condition:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    continue-on-error: true
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+      with:
+        persist-credentials: false
+    - name: scan-inventory-atomic-decrement
+      run: "# Set up output capture for the annotation-to-SARIF step.\nexec > >(tee\
+        \ -a ecommerce-inventory-race.shell_log) 2>&1\n# Run the original script in\
+        \ a subshell with set +e so\n# that any single command failure does not abort\
+        \ the\n# script before it can emit a '::error' annotation.\ninner_exit=0\n\
+        ( set +e\nfail=0\n# Look for naive stock update without guard\nif grep -rnE\
+        \ 'product\\.stock\\s*[-]=' src/ 2>/dev/null | grep -q .; then\n  echo '::error\
+        \ file=src/services/inventory.ts::Stock decremented without atomic guard \u2014\
+        \ use Product.findOneAndUpdate({stock:{$gt:0}}, {$inc:{stock:-1}})'\n  fail=1\n\
+        fi\n# Look for read-then-write pattern (TOCTOU)\nif grep -rnE 'await\\s+Product\\\
+        .findById.*\\n.*\\.stock' src/ 2>/dev/null | grep -q .; then\n  echo '::error\
+        \ file=src/routes/checkout.js::Read-then-write stock check detected \u2014\
+        \ race condition (CWE-367)'\n  fail=1\nfi\nexit $fail\n) || inner_exit=$?\n\
+        # If the inner script exited non-zero and emitted no\n# '::error'/'::warning'\
+        \ annotation, synthesise one so the\n# SARIF conversion step still has a finding\
+        \ to record.\nif [ \"$inner_exit\" -ne 0 ] && ! grep -qE '^::(error|warning)'\
+        \ ecommerce-inventory-race.shell_log; then\n  echo \"::error file=scan-inventory-atomic-decrement::shell\
+        \ check failed (exit code $inner_exit) \u2014 see run log for details\"\n\
+        fi\nexit $inner_exit\n"
+    - name: Convert ecommerce-inventory-race shell_check annotations to SARIF
+      if: always()
+      run: "cat > ecommerce-inventory-race_annotations_to_sarif.py <<'PY_EOF'\nimport\
+        \ os, re, json\nlog_path = 'ecommerce-inventory-race.shell_log'\nsarif_path\
+        \ = 'ecommerce-inventory-race-results.sarif'\ntool_name = 'ecommerce-inventory-race'\n\
+        tool_version = '1.0.0'\ninformation_uri = 'https://github.com/iqbalrsyd/ai-devsecops'\n\
+        rule_id_prefix = 'ai-devsecops-ecommerce-inventory-race'\nresults = []\nif\
+        \ os.path.exists(log_path):\n    pat = re.compile(\n        r'^::(error|warning)(?:\\\
+        s+([A-Za-z]+=[^,]+(?:,[A-Za-z]+=[^,]+)*))?::(.*)$'\n    )\n    for idx, line\
+        \ in enumerate(open(log_path, encoding='utf-8', errors='replace')):\n    \
+        \    m = pat.match(line.rstrip('\\n'))\n        if not m:\n            continue\n\
+        \        level, props, msg = m.groups()\n        path = None\n        sl =\
+        \ None\n        el = None\n        title = None\n        if props:\n     \
+        \       for kv in props.split(','):\n                if '=' in kv:\n     \
+        \               k, v = kv.split('=', 1)\n                    k = k.strip()\n\
+        \                    v = v.strip()\n                    if k == 'file':\n\
+        \                        path = v\n                    elif k == 'line':\n\
+        \                        try:\n                            sl = int(v)\n \
+        \                       except ValueError:\n                            pass\n\
+        \                    elif k in ('endLine', 'col'):\n                     \
+        \   try:\n                            el = int(v) if k == 'endLine' else sl\n\
+        \                        except ValueError:\n                            pass\n\
+        \                    elif k == 'title':\n                        title = v\n\
+        \        if sl is None:\n            sl = 1\n        if el is None:\n    \
+        \        el = sl\n        sarif_level = 'error' if level == 'error' else 'warning'\n\
+        \        msg = (msg or '').strip()\n        # If there is no file but there\
+        \ is a title, use the\n        if not msg and title:\n            msg = title\n\
+        \        # Use the first 50 chars of the title (if any) as\n        slug_src\
+        \ = title or msg or 'finding'\n        slug = re.sub(r'[^a-z0-9]+', '-', slug_src.lower())[:50].strip('-')\n\
+        \        rule_id = f'{rule_id_prefix}-{slug}-{sl}-{idx}'\n        results.append({\n\
+        \            'ruleId': rule_id,\n            'level': sarif_level,\n     \
+        \       'message': {'text': msg or '(no message)'},\n            'locations':\
+        \ [{\n                'physicalLocation': {\n                    'artifactLocation':\
+        \ {'uri': path or 'unknown'},\n                    'region': {'startLine':\
+        \ sl, 'endLine': el},\n                },\n            }],\n        })\nexisting\
+        \ = {}\nif os.path.exists(sarif_path) and os.path.getsize(sarif_path) > 0:\n\
+        \    try:\n        existing = json.load(open(sarif_path, encoding='utf-8'))\n\
+        \    except Exception:\n        existing = {}\nif not existing or 'runs' not\
+        \ in existing or not existing['runs']:\n    existing = {\n        'version':\
+        \ '2.1.0',\n        '$schema': 'https://json.schemastore.org/sarif-2.1.0.json',\n\
+        \        'runs': [{\n            'tool': {'driver': {\n                'name':\
+        \ tool_name, 'version': tool_version, 'informationUri': information_uri,\n\
+        \            }},\n            'results': [],\n        }],\n    }\nexisting['runs'][0]['tool']['driver']['name']\
+        \ = tool_name\nexisting['runs'][0]['tool']['driver']['version'] = tool_version\n\
+        existing['runs'][0]['tool']['driver']['informationUri'] = information_uri\n\
+        existing['runs'][0]['results'] = (existing['runs'][0].get('results') or [])\
+        \ + results\nwith open(sarif_path, 'w', encoding='utf-8') as f:\n    json.dump(existing,\
+        \ f, indent=2)\nprint(f'Wrote {len(results)} SARIF result(s) to {sarif_path}')\n\
+        PY_EOF\npython3 ecommerce-inventory-race_annotations_to_sarif.py\n"
+    - name: Ensure ecommerce-inventory-race-results.sarif exists (fallback for 0 findings)
+      if: always()
+      run: "if [ ! -s ecommerce-inventory-race-results.sarif ]; then\n  echo \"::notice::ecommerce-inventory-race\
+        \ found 0 findings. Generating empty SARIF to satisfy upload-sarif.\"\n  printf\
+        \ '%s\\n' \\\n    '{' \\\n    '  \"version\": \"2.1.0\",' \\\n    '  \"$schema\"\
+        : \"https://json.schemastore.org/sarif-2.1.0.json\",' \\\n    '  \"runs\"\
+        : [' \\\n    '    {' \\\n    '      \"tool\": {' \\\n    '        \"driver\"\
+        : {' \\\n    '          \"name\": \"ecommerce-inventory-race\",' \\\n    '\
+        \          \"version\": \"0.65.0\",' \\\n    '          \"informationUri\"\
+        : \"https://aquasecurity.github.io/trivy/\"' \\\n    '        }' \\\n    '\
+        \      },' \\\n    '      \"results\": []' \\\n    '    }' \\\n    '  ]' \\\
+        \n    '}' > ecommerce-inventory-race-results.sarif\nfi\necho \"\u2713 ecommerce-inventory-race-results.sarif\
+        \ size: $(stat -c%s ecommerce-inventory-race-results.sarif) bytes\"\n"
+    - name: Upload ecommerce-inventory-race SARIF to GitHub Code Scanning
+      if: always()
+      uses: github/codeql-action/upload-sarif@b1722c1245f90604c2c348f9d1624af97ea8fc6e
+      with:
+        sarif_file: ecommerce-inventory-race-results.sarif
+        category: ecommerce-inventory-race
+  ecommerce-refund-idor-protection:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    continue-on-error: true
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+      with:
+        persist-credentials: false
+    - name: scan-refund-ownership
+      run: "# Set up output capture for the annotation-to-SARIF step.\nexec > >(tee\
+        \ -a ecommerce-refund-idor.shell_log) 2>&1\n# Run the original script in a\
+        \ subshell with set +e so\n# that any single command failure does not abort\
+        \ the\n# script before it can emit a '::error' annotation.\ninner_exit=0\n\
+        ( set +e\nfail=0\nfor route in refund cancel order; do\n  if grep -rnE \"\
+        router\\.(post|put|delete)\\s*\\(\\s*['\\\"]\\/?$route\\/:id\" src/ 2>/dev/null\
+        \ | grep -q .; then\n    if ! grep -rnE '(req\\.user\\.id|order\\.userId|verifyOwner|checkOwnership)'\
+        \ src/routes/ 2>/dev/null | grep -q .; then\n      echo \"::error file=src/routes/$route.js::$route/:id\
+        \ endpoint missing ownership check \u2014 IDOR allows refund/cancel of other\
+        \ users' orders\"\n      fail=1\n    fi\n  fi\ndone\nexit $fail\n) || inner_exit=$?\n\
+        # If the inner script exited non-zero and emitted no\n# '::error'/'::warning'\
+        \ annotation, synthesise one so the\n# SARIF conversion step still has a finding\
+        \ to record.\nif [ \"$inner_exit\" -ne 0 ] && ! grep -qE '^::(error|warning)'\
+        \ ecommerce-refund-idor.shell_log; then\n  echo \"::error file=scan-refund-ownership::shell\
+        \ check failed (exit code $inner_exit) \u2014 see run log for details\"\n\
+        fi\nexit $inner_exit\n"
+    - name: Convert ecommerce-refund-idor shell_check annotations to SARIF
+      if: always()
+      run: "cat > ecommerce-refund-idor_annotations_to_sarif.py <<'PY_EOF'\nimport\
+        \ os, re, json\nlog_path = 'ecommerce-refund-idor.shell_log'\nsarif_path =\
+        \ 'ecommerce-refund-idor-results.sarif'\ntool_name = 'ecommerce-refund-idor'\n\
+        tool_version = '1.0.0'\ninformation_uri = 'https://github.com/iqbalrsyd/ai-devsecops'\n\
+        rule_id_prefix = 'ai-devsecops-ecommerce-refund-idor'\nresults = []\nif os.path.exists(log_path):\n\
+        \    pat = re.compile(\n        r'^::(error|warning)(?:\\s+([A-Za-z]+=[^,]+(?:,[A-Za-z]+=[^,]+)*))?::(.*)$'\n\
+        \    )\n    for idx, line in enumerate(open(log_path, encoding='utf-8', errors='replace')):\n\
+        \        m = pat.match(line.rstrip('\\n'))\n        if not m:\n          \
+        \  continue\n        level, props, msg = m.groups()\n        path = None\n\
+        \        sl = None\n        el = None\n        title = None\n        if props:\n\
+        \            for kv in props.split(','):\n                if '=' in kv:\n\
+        \                    k, v = kv.split('=', 1)\n                    k = k.strip()\n\
+        \                    v = v.strip()\n                    if k == 'file':\n\
+        \                        path = v\n                    elif k == 'line':\n\
+        \                        try:\n                            sl = int(v)\n \
+        \                       except ValueError:\n                            pass\n\
+        \                    elif k in ('endLine', 'col'):\n                     \
+        \   try:\n                            el = int(v) if k == 'endLine' else sl\n\
+        \                        except ValueError:\n                            pass\n\
+        \                    elif k == 'title':\n                        title = v\n\
+        \        if sl is None:\n            sl = 1\n        if el is None:\n    \
+        \        el = sl\n        sarif_level = 'error' if level == 'error' else 'warning'\n\
+        \        msg = (msg or '').strip()\n        # If there is no file but there\
+        \ is a title, use the\n        if not msg and title:\n            msg = title\n\
+        \        # Use the first 50 chars of the title (if any) as\n        slug_src\
+        \ = title or msg or 'finding'\n        slug = re.sub(r'[^a-z0-9]+', '-', slug_src.lower())[:50].strip('-')\n\
+        \        rule_id = f'{rule_id_prefix}-{slug}-{sl}-{idx}'\n        results.append({\n\
+        \            'ruleId': rule_id,\n            'level': sarif_level,\n     \
+        \       'message': {'text': msg or '(no message)'},\n            'locations':\
+        \ [{\n                'physicalLocation': {\n                    'artifactLocation':\
+        \ {'uri': path or 'unknown'},\n                    'region': {'startLine':\
+        \ sl, 'endLine': el},\n                },\n            }],\n        })\nexisting\
+        \ = {}\nif os.path.exists(sarif_path) and os.path.getsize(sarif_path) > 0:\n\
+        \    try:\n        existing = json.load(open(sarif_path, encoding='utf-8'))\n\
+        \    except Exception:\n        existing = {}\nif not existing or 'runs' not\
+        \ in existing or not existing['runs']:\n    existing = {\n        'version':\
+        \ '2.1.0',\n        '$schema': 'https://json.schemastore.org/sarif-2.1.0.json',\n\
+        \        'runs': [{\n            'tool': {'driver': {\n                'name':\
+        \ tool_name, 'version': tool_version, 'informationUri': information_uri,\n\
+        \            }},\n            'results': [],\n        }],\n    }\nexisting['runs'][0]['tool']['driver']['name']\
+        \ = tool_name\nexisting['runs'][0]['tool']['driver']['version'] = tool_version\n\
+        existing['runs'][0]['tool']['driver']['informationUri'] = information_uri\n\
+        existing['runs'][0]['results'] = (existing['runs'][0].get('results') or [])\
+        \ + results\nwith open(sarif_path, 'w', encoding='utf-8') as f:\n    json.dump(existing,\
+        \ f, indent=2)\nprint(f'Wrote {len(results)} SARIF result(s) to {sarif_path}')\n\
+        PY_EOF\npython3 ecommerce-refund-idor_annotations_to_sarif.py\n"
+    - name: Ensure ecommerce-refund-idor-results.sarif exists (fallback for 0 findings)
+      if: always()
+      run: "if [ ! -s ecommerce-refund-idor-results.sarif ]; then\n  echo \"::notice::ecommerce-refund-idor\
+        \ found 0 findings. Generating empty SARIF to satisfy upload-sarif.\"\n  printf\
+        \ '%s\\n' \\\n    '{' \\\n    '  \"version\": \"2.1.0\",' \\\n    '  \"$schema\"\
+        : \"https://json.schemastore.org/sarif-2.1.0.json\",' \\\n    '  \"runs\"\
+        : [' \\\n    '    {' \\\n    '      \"tool\": {' \\\n    '        \"driver\"\
+        : {' \\\n    '          \"name\": \"ecommerce-refund-idor\",' \\\n    '  \
+        \        \"version\": \"0.65.0\",' \\\n    '          \"informationUri\":\
+        \ \"https://aquasecurity.github.io/trivy/\"' \\\n    '        }' \\\n    '\
+        \      },' \\\n    '      \"results\": []' \\\n    '    }' \\\n    '  ]' \\\
+        \n    '}' > ecommerce-refund-idor-results.sarif\nfi\necho \"\u2713 ecommerce-refund-idor-results.sarif\
+        \ size: $(stat -c%s ecommerce-refund-idor-results.sarif) bytes\"\n"
+    - name: Upload ecommerce-refund-idor SARIF to GitHub Code Scanning
+      if: always()
+      uses: github/codeql-action/upload-sarif@b1722c1245f90604c2c348f9d1624af97ea8fc6e
+      with:
+        sarif_file: ecommerce-refund-idor-results.sarif
+        category: ecommerce-refund-idor
