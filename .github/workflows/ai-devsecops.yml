@@ -67,16 +67,12 @@ jobs:
         \ flag below imports any custom\n# rules committed by `pull_request_creation_node`;\
         \ if the\n# directory is missing, semgrep returns exit 7 (config\n# error).\
         \ Create an empty dir so the import is a no-op\n# rather than a hard failure.\n\
-        mkdir -p .semgrep\n# Only run semgrep if at least one registry config is\n\
-        # declared; otherwise the previous run already proved\n# the repo has no language\
-        \ that maps to a registry ruleset.\nif [ -z \"${{ env.SEMGREP_REGISTRY_CONFIGS\
-        \ }}\" ]; then\n  echo '::notice::No Semgrep registry configs selected for\
-        \ this language; writing empty SARIF.'\n  exit 0\nfi\ndocker run --rm \\\n\
-        \  -v \"${{ github.workspace }}:/src\" \\\n  returntocorp/semgrep:1.99.0 \\\
-        \n  semgrep ci \\\n    --config=.semgrep \\\n    --config=p/python \\\n  \
-        \  --config=p/django \\\n    --config=p/flask \\\n    --config=p/fastapi \\\
-        \n    --config=p/owasp-top-ten \\\n    --config=p/secrets \\\n    --config=p/security-audit\
-        \ \\\n  --sarif --output=/src/semgrep-results.sarif \\\n  --timeout=600 --no-suppress-errors\n"
+        mkdir -p .semgrep\ndocker run --rm \\\n  -v \"${{ github.workspace }}:/src\"\
+        \ \\\n  returntocorp/semgrep:1.99.0 \\\n  semgrep ci \\\n    --config=.semgrep\
+        \ \\\n    --config=p/python \\\n    --config=p/django \\\n    --config=p/flask\
+        \ \\\n    --config=p/fastapi \\\n    --config=p/owasp-top-ten \\\n    --config=p/secrets\
+        \ \\\n    --config=p/security-audit \\\n  --sarif --output=/src/semgrep-results.sarif\
+        \ \\\n  --timeout=600 --no-suppress-errors\n"
       continue-on-error: true
     - name: Ensure Semgrep SARIF file exists (fallback for 0 findings or scan error)
       if: always()
@@ -390,5 +386,5 @@ jobs:
     - container-scan
     uses: ./.github/workflows/ai-devsecops-custom.yml
     with:
-      detected_domain: e-commerce
+      detected_domain: general
     secrets: inherit
