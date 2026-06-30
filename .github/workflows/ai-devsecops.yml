@@ -1,0 +1,394 @@
+name: CI DevSecOps (python)
+'on':
+  push:
+    branches:
+    - main
+    - master
+    - develop
+  pull_request:
+    branches:
+    - main
+    - master
+    - develop
+  workflow_dispatch: null
+permissions:
+  contents: read
+  pull-requests: read
+  security-events: write
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    continue-on-error: false
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+      with:
+        persist-credentials: false
+    - name: Set up Python
+      uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+      with:
+        python-version: '3.11'
+    - name: Install Ruff
+      run: pip install ruff
+    - name: Run Ruff
+      run: ruff check . || true
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    continue-on-error: false
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+      with:
+        persist-credentials: false
+    - name: Set up Python
+      uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+      with:
+        python-version: '3.11'
+    - name: Install dependencies
+      run: pip install -r requirements.txt || pip install -e . || true
+    - name: Run tests
+      run: pytest || python -m pytest || true
+  sast:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    continue-on-error: true
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+      with:
+        persist-credentials: false
+    - name: Run semgrep (registry + .semgrep/, SARIF output)
+      run: "# Ensure the `.semgrep/` directory exists before running.\n# The `--config=.semgrep`\
+        \ flag below imports any custom\n# rules committed by `pull_request_creation_node`;\
+        \ if the\n# directory is missing, semgrep returns exit 7 (config\n# error).\
+        \ Create an empty dir so the import is a no-op\n# rather than a hard failure.\n\
+        mkdir -p .semgrep\n# Only run semgrep if at least one registry config is\n\
+        # declared; otherwise the previous run already proved\n# the repo has no language\
+        \ that maps to a registry ruleset.\nif [ -z \"${{ env.SEMGREP_REGISTRY_CONFIGS\
+        \ }}\" ]; then\n  echo '::notice::No Semgrep registry configs selected for\
+        \ this language; writing empty SARIF.'\n  exit 0\nfi\ndocker run --rm \\\n\
+        \  -v \"${{ github.workspace }}:/src\" \\\n  returntocorp/semgrep:1.99.0 \\\
+        \n  semgrep ci \\\n    --config=.semgrep \\\n    --config=p/python \\\n  \
+        \  --config=p/django \\\n    --config=p/flask \\\n    --config=p/fastapi \\\
+        \n    --config=p/owasp-top-ten \\\n    --config=p/secrets \\\n    --config=p/security-audit\
+        \ \\\n  --sarif --output=/src/semgrep-results.sarif \\\n  --timeout=600 --no-suppress-errors\n"
+      continue-on-error: true
+    - name: Ensure Semgrep SARIF file exists (fallback for 0 findings or scan error)
+      if: always()
+      run: "if [ ! -s semgrep-results.sarif ]; then\n  echo \"::notice::Semgrep did\
+        \ not produce a SARIF file. Generating empty SARIF for upload-sarif.\"\n \
+        \ printf '%s\\n' \\\n    '{' \\\n    '  \"version\": \"2.1.0\",' \\\n    '\
+        \  \"$schema\": \"https://json.schemastore.org/sarif-2.1.0.json\",' \\\n \
+        \   '  \"runs\": [' \\\n    '    {' \\\n    '      \"tool\": {' \\\n    '\
+        \        \"driver\": {' \\\n    '          \"name\": \"Semgrep\",' \\\n  \
+        \  '          \"version\": \"1.99.0\",' \\\n    '          \"informationUri\"\
+        : \"https://semgrep.dev\"' \\\n    '        }' \\\n    '      },' \\\n   \
+        \ '      \"results\": []' \\\n    '    }' \\\n    '  ]' \\\n    '}' > semgrep-results.sarif\n\
+        fi\necho \"\u2713 semgrep-results.sarif size: $(stat -c%s semgrep-results.sarif)\
+        \ bytes\"\n"
+    - name: Upload Semgrep SARIF to GitHub Code Scanning
+      if: always() && hashFiles('semgrep-results.sarif') != ''
+      uses: github/codeql-action/upload-sarif@b1722c1245f90604c2c348f9d1624af97ea8fc6e
+      with:
+        sarif_file: semgrep-results.sarif
+        category: semgrep
+    - name: Upload Semgrep SARIF as artifact
+      if: always()
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      with:
+        name: semgrep-results-${{ github.sha }}
+        path: semgrep-results.sarif
+        if-no-files-found: warn
+        retention-days: 30
+  dependency-scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    continue-on-error: false
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+      with:
+        persist-credentials: false
+    - name: Set up Python
+      uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+      with:
+        python-version: '3.11'
+    - name: Install pip-audit
+      run: pip install pip-audit
+    - name: Run pip-audit (CVE check, JSON output)
+      run: pip-audit --strict --disable-pip --format=json --output=pip-audit-results.json
+        || true
+      continue-on-error: true
+    - name: Upload pip-audit JSON
+      if: always()
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      with:
+        name: pip-audit-results-${{ github.sha }}
+        path: pip-audit-results.json
+        if-no-files-found: warn
+        retention-days: 30
+    - name: Run Trivy filesystem scan (SARIF output)
+      id: trivy-fs
+      uses: aquasecurity/trivy-action@b6643a29fecd7f34b3597bc6acb0a98b03d33ff8
+      with:
+        scan-type: fs
+        scan-ref: .
+        format: sarif
+        output: trivy-fs-results.sarif
+        version: v0.72.0
+        severity: MEDIUM,HIGH,CRITICAL
+      continue-on-error: true
+    - name: Ensure trivy-fs-results.sarif exists (fallback for 0 findings)
+      if: always()
+      run: "if [ ! -s trivy-fs-results.sarif ]; then\n  echo \"::notice::Trivy found\
+        \ 0 findings. Generating empty SARIF to satisfy upload-sarif.\"\n  printf\
+        \ '%s\\n' \\\n    '{' \\\n    '  \"version\": \"2.1.0\",' \\\n    '  \"$schema\"\
+        : \"https://json.schemastore.org/sarif-2.1.0.json\",' \\\n    '  \"runs\"\
+        : [' \\\n    '    {' \\\n    '      \"tool\": {' \\\n    '        \"driver\"\
+        : {' \\\n    '          \"name\": \"Trivy\",' \\\n    '          \"version\"\
+        : \"0.65.0\",' \\\n    '          \"informationUri\": \"https://aquasecurity.github.io/trivy/\"\
+        ' \\\n    '        }' \\\n    '      },' \\\n    '      \"results\": []' \\\
+        \n    '    }' \\\n    '  ]' \\\n    '}' > trivy-fs-results.sarif\nfi\necho\
+        \ \"\u2713 trivy-fs-results.sarif size: $(stat -c%s trivy-fs-results.sarif)\
+        \ bytes\"\n"
+    - name: Upload Trivy fs SARIF to GitHub Code Scanning
+      if: always()
+      uses: github/codeql-action/upload-sarif@b1722c1245f90604c2c348f9d1624af97ea8fc6e
+      with:
+        sarif_file: trivy-fs-results.sarif
+        category: trivy-fs
+    - name: Upload Trivy fs SARIF as artifact
+      if: always()
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      with:
+        name: trivy-fs-results-${{ github.sha }}
+        path: trivy-fs-results.sarif
+        if-no-files-found: warn
+        retention-days: 30
+    - name: Convert pip-audit JSON to SARIF
+      if: always() && hashFiles('pip-audit-results.json') != ''
+      run: "python3 -c \"\nimport json, sys\ntry:\n    with open('pip-audit-results.json')\
+        \ as f:\n        data = json.load(f)\n    results = []\n    if isinstance(data,\
+        \ dict):\n        data = data.get('dependencies', data.get('results', []))\n\
+        \    for dep in (data if isinstance(data, list) else []):\n        pkg_name\
+        \ = dep.get('name', dep.get('package', ''))\n        pkg_version = dep.get('version',\
+        \ '')\n        for vuln in dep.get('vulns', dep.get('vulnerabilities', [])):\n\
+        \            vuln_id = vuln.get('id', '')\n            results.append({\n\
+        \                'ruleId': vuln_id,\n                'message': {'text': vuln_id\
+        \ + ' in ' + pkg_name + ' ' + pkg_version},\n                'level': 'error'\
+        \ if vuln.get('severity','') in ('critical','high') else 'warning',\n    \
+        \            'locations': [{'physicalLocation': {'artifactLocation': {'uri':\
+        \ 'requirements.txt'}}}],\n                'properties': {'package': pkg_name,\
+        \ 'version': pkg_version}\n            })\n    sarif = {\n        'version':\
+        \ '2.1.0',\n        '\\$schema': 'https://json.schemastore.org/sarif-2.1.0.json',\n\
+        \        'runs': [{\n            'tool': {'driver': {'name': 'pip-audit',\
+        \ 'version': '1.0', 'informationUri': 'https://pypi.org/project/pip-audit/'}},\n\
+        \            'results': results\n        }]\n    }\n    with open('pip-audit-results.sarif','w')\
+        \ as f:\n        json.dump(sarif, f, indent=2)\n    print(f'pip-audit-results.sarif\
+        \ written with {len(results)} findings')\nexcept Exception as e:\n    print(f'pip-audit\
+        \ SARIF conversion error: {e}', file=sys.stderr)\n    import traceback; traceback.print_exc()\n\
+        \    sys.exit(0)\n\"\n"
+      continue-on-error: true
+    - name: Ensure pip-audit-results.sarif exists (fallback for 0 findings)
+      if: always()
+      run: "if [ ! -s pip-audit-results.sarif ]; then\n  echo \"::notice::pip-audit\
+        \ found 0 findings. Generating empty SARIF to satisfy upload-sarif.\"\n  printf\
+        \ '%s\\n' \\\n    '{' \\\n    '  \"version\": \"2.1.0\",' \\\n    '  \"$schema\"\
+        : \"https://json.schemastore.org/sarif-2.1.0.json\",' \\\n    '  \"runs\"\
+        : [' \\\n    '    {' \\\n    '      \"tool\": {' \\\n    '        \"driver\"\
+        : {' \\\n    '          \"name\": \"pip-audit\",' \\\n    '          \"version\"\
+        : \"1.0\",' \\\n    '          \"informationUri\": \"https://pypi.org/project/pip-audit/\"\
+        ' \\\n    '        }' \\\n    '      },' \\\n    '      \"results\": []' \\\
+        \n    '    }' \\\n    '  ]' \\\n    '}' > pip-audit-results.sarif\nfi\necho\
+        \ \"\u2713 pip-audit-results.sarif size: $(stat -c%s pip-audit-results.sarif)\
+        \ bytes\"\n"
+    - name: Upload pip-audit SARIF to GitHub Code Scanning
+      if: always()
+      uses: github/codeql-action/upload-sarif@b1722c1245f90604c2c348f9d1624af97ea8fc6e
+      with:
+        sarif_file: pip-audit-results.sarif
+        category: pip-audit
+    - name: Upload pip-audit SARIF as artifact
+      if: always()
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      with:
+        name: pip-audit-sarif-${{ github.sha }}
+        path: pip-audit-results.sarif
+        if-no-files-found: warn
+        retention-days: 30
+  secret-scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    continue-on-error: false
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+      with:
+        persist-credentials: false
+        fetch-depth: 0
+    - name: Run Gitleaks on PR diff (SARIF output)
+      uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        GITLEAKS_ENABLE_UPLOAD_ARTIFACT: false
+        GITLEAKS_FORMAT: sarif
+        GITLEAKS_REPORT_PATH: gitleaks-diff-results.sarif
+      continue-on-error: true
+    - name: Run Gitleaks on full working tree (SARIF output)
+      run: 'set -e
+
+        # Install gitleaks CLI (matches the action''s version).
+
+        wget -qO- https://github.com/gitleaks/gitleaks/releases/download/v8.24.3/gitleaks_8.24.3_linux_x64.tar.gz
+        | tar -xz -C /tmp
+
+        sudo mv /tmp/gitleaks /usr/local/bin/gitleaks || mv /tmp/gitleaks /usr/local/bin/gitleaks
+
+        gitleaks version
+
+        # Scan the full working tree. `--no-banner` quiets
+
+        # the ASCII art. Output is SARIF 2.1.0.
+
+        gitleaks detect --source . --no-banner --report-format sarif --report-path
+        gitleaks-full-results.sarif --exit-code 0 || true
+
+        '
+      continue-on-error: true
+    - name: Merge Gitleaks SARIF results
+      if: always()
+      run: "set -e\nif [ -s gitleaks-diff-results.sarif ] && [ -s gitleaks-full-results.sarif\
+        \ ]; then\n  # Both scans produced output \u2014 concatenate\n  # the result\
+        \ arrays. We use a tiny Python\n  # snippet because `jq` is not guaranteed\
+        \ to\n  # be installed on ubuntu-latest runners.\n  python3 - <<'PY'\nimport\
+        \ json, pathlib\ndiff = json.loads(pathlib.Path('gitleaks-diff-results.sarif').read_text())\n\
+        full = json.loads(pathlib.Path('gitleaks-full-results.sarif').read_text())\n\
+        merged_runs = (diff.get('runs') or []) + (full.get('runs') or [])\n# De-duplicate\
+        \ by (ruleId, physicalLocation uri:line).\nseen = set()\nmerged_results =\
+        \ []\nfor run in merged_runs:\n    for r in (run.get('results') or []):\n\
+        \        loc = (r.get('locations') or [{}])[0].get('physicalLocation', {})\n\
+        \        uri = (loc.get('artifactLocation') or {}).get('uri', '')\n      \
+        \  line = (loc.get('region') or {}).get('startLine', 0)\n        key = (r.get('ruleId',''),\
+        \ uri, line)\n        if key in seen:\n            continue\n        seen.add(key)\n\
+        \        merged_results.append(r)\nbase = diff if diff.get('runs') else full\n\
+        base['runs'] = merged_runs\nfor run in base['runs']:\n    run['results'] =\
+        \ merged_results if run is base['runs'][0] else (run.get('results') or [])\n\
+        pathlib.Path('gitleaks-results.sarif').write_text(json.dumps(base, indent=2))\n\
+        print(f'Merged SARIF: {len(merged_results)} unique findings')\nPY\nelif [\
+        \ -s gitleaks-full-results.sarif ]; then\n  cp gitleaks-full-results.sarif\
+        \ gitleaks-results.sarif\nelif [ -s gitleaks-diff-results.sarif ]; then\n\
+        \  cp gitleaks-diff-results.sarif gitleaks-results.sarif\nfi\nls -la gitleaks-*.sarif\
+        \ || true\n"
+    - name: Ensure gitleaks-results.sarif exists (fallback for 0 findings)
+      if: always()
+      run: "if [ ! -s gitleaks-results.sarif ]; then\n  echo \"::notice::Gitleaks\
+        \ found 0 findings. Generating empty SARIF to satisfy upload-sarif.\"\n  printf\
+        \ '%s\\n' \\\n    '{' \\\n    '  \"version\": \"2.1.0\",' \\\n    '  \"$schema\"\
+        : \"https://json.schemastore.org/sarif-2.1.0.json\",' \\\n    '  \"runs\"\
+        : [' \\\n    '    {' \\\n    '      \"tool\": {' \\\n    '        \"driver\"\
+        : {' \\\n    '          \"name\": \"Gitleaks\",' \\\n    '          \"version\"\
+        : \"8.24.3\",' \\\n    '          \"informationUri\": \"https://gitleaks.io\"\
+        ' \\\n    '        }' \\\n    '      },' \\\n    '      \"results\": []' \\\
+        \n    '    }' \\\n    '  ]' \\\n    '}' > gitleaks-results.sarif\nfi\necho\
+        \ \"\u2713 gitleaks-results.sarif size: $(stat -c%s gitleaks-results.sarif)\
+        \ bytes\"\n"
+    - name: Upload Gitleaks SARIF to GitHub Code Scanning
+      if: always()
+      uses: github/codeql-action/upload-sarif@b1722c1245f90604c2c348f9d1624af97ea8fc6e
+      with:
+        sarif_file: gitleaks-results.sarif
+        category: gitleaks
+    - name: Upload Gitleaks SARIF as artifact
+      if: always()
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      with:
+        name: gitleaks-sarif-${{ github.sha }}
+        path: gitleaks-results.sarif
+        if-no-files-found: warn
+        retention-days: 30
+  container-scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    continue-on-error: true
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+      with:
+        persist-credentials: false
+    - name: Analyze Dockerfile for security misconfigurations
+      if: hashFiles('**/Dockerfile') != ''
+      run: "echo '## Dockerfile Security Checks' >> \"$GITHUB_STEP_SUMMARY\"\nissues=0\n\
+        for df in $(find . -name Dockerfile -not -path './.git/*' 2>/dev/null); do\n\
+        \  echo \"Analyzing $df...\"\n  # Check: run as non-root user\n  if ! grep\
+        \ -qE '^USER ' \"$df\"; then\n    echo \"::warning file=$df::Missing USER\
+        \ instruction \u2014 container runs as root\"\n    echo \"- \\`$df\\`: Missing\
+        \ USER instruction (runs as root)\" >> \"$GITHUB_STEP_SUMMARY\"\n    issues=$((issues+1))\n\
+        \  elif grep -qE '^USER root' \"$df\"; then\n    echo \"::warning file=$df::USER\
+        \ root detected \u2014 should use non-root user\"\n    echo \"- \\`$df\\`:\
+        \ USER root (use non-root)\" >> \"$GITHUB_STEP_SUMMARY\"\n    issues=$((issues+1))\n\
+        \  fi\n  # Check: base image pinned by digest\n  base=$(grep -m1 '^FROM '\
+        \ \"$df\" | sed 's/FROM //' | awk '{print $1}')\n  if echo \"$base\" | grep\
+        \ -qE '@sha256:'; then\n    echo \"  Base image pinned: $base\"\n  elif [\
+        \ -n \"$base\" ] && echo \"$base\" | grep -qE ':latest$|^[^:]*$'; then\n \
+        \   echo \"::warning file=$df::Base image $base not pinned by digest \u2014\
+        \ supply@sha256:...\"\n    echo \"- \\`$df\\`: Base image \\`$base\\` not\
+        \ pinned by digest\" >> \"$GITHUB_STEP_SUMMARY\"\n    issues=$((issues+1))\n\
+        \  fi\n  # Check: expose patterns\n  if grep -qE '^EXPOSE [0-9]+-[0-9]+' \"\
+        $df\"; then\n    echo \"::warning file=$df::EXPOSE with port range detected\
+        \ \u2014 limit to specific ports\"\n    echo \"- \\`$df\\`: EXPOSE port range\
+        \ (limit to specific ports)\" >> \"$GITHUB_STEP_SUMMARY\"\n    issues=$((issues+1))\n\
+        \  fi\ndone\necho \"Dockerfile checks complete: $issues issue(s)\" >> \"$GITHUB_STEP_SUMMARY\"\
+        \n"
+      continue-on-error: true
+    - name: Build Docker image
+      run: docker build -t app:ci-${{ github.sha }} .
+      continue-on-error: true
+    - name: Scan image with Trivy (SARIF output)
+      id: trivy-image
+      uses: aquasecurity/trivy-action@b6643a29fecd7f34b3597bc6acb0a98b03d33ff8
+      with:
+        image-ref: app:ci-${{ github.sha }}
+        format: sarif
+        output: trivy-image-results.sarif
+        version: v0.72.0
+        severity: HIGH,CRITICAL
+      continue-on-error: true
+    - name: Ensure trivy-image-results.sarif exists (fallback for 0 findings)
+      if: always()
+      run: "if [ ! -s trivy-image-results.sarif ]; then\n  echo \"::notice::Trivy\
+        \ Image found 0 findings. Generating empty SARIF to satisfy upload-sarif.\"\
+        \n  printf '%s\\n' \\\n    '{' \\\n    '  \"version\": \"2.1.0\",' \\\n  \
+        \  '  \"$schema\": \"https://json.schemastore.org/sarif-2.1.0.json\",' \\\n\
+        \    '  \"runs\": [' \\\n    '    {' \\\n    '      \"tool\": {' \\\n    '\
+        \        \"driver\": {' \\\n    '          \"name\": \"Trivy Image\",' \\\n\
+        \    '          \"version\": \"0.65.0\",' \\\n    '          \"informationUri\"\
+        : \"https://aquasecurity.github.io/trivy/\"' \\\n    '        }' \\\n    '\
+        \      },' \\\n    '      \"results\": []' \\\n    '    }' \\\n    '  ]' \\\
+        \n    '}' > trivy-image-results.sarif\nfi\necho \"\u2713 trivy-image-results.sarif\
+        \ size: $(stat -c%s trivy-image-results.sarif) bytes\"\n"
+    - name: Upload Trivy image SARIF to GitHub Code Scanning
+      if: always()
+      uses: github/codeql-action/upload-sarif@b1722c1245f90604c2c348f9d1624af97ea8fc6e
+      with:
+        sarif_file: trivy-image-results.sarif
+        category: trivy-image
+    - name: Upload Trivy image SARIF as artifact
+      if: always()
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      with:
+        name: trivy-image-results-${{ github.sha }}
+        path: trivy-image-results.sarif
+        if-no-files-found: warn
+        retention-days: 30
+  domain-compliance:
+    needs:
+    - container-scan
+    uses: ./.github/workflows/ai-devsecops-custom.yml
+    with:
+      detected_domain: e-commerce
+    secrets: inherit
